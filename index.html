@@ -792,7 +792,26 @@ function go(v, fromHash) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 $$('.tabs button').forEach(b => b.onclick = () => go(b.dataset.view));
-window.addEventListener('hashchange', () => go(location.hash.slice(1), true));
+window.addEventListener('hashchange', () => { if (!takeJoinHash()) go(location.hash.slice(1), true); });
+/* An invite link ends in #join-<code>: open the online room tab and join that room. */
+let pendingJoin = null;
+function takeJoinHash() {
+  const mm = /^#join-([a-z0-9]{5})$/i.exec(location.hash);
+  if (!mm) return false;
+  pendingJoin = mm[1].toLowerCase();
+  fmode = 'online';
+  $$('.seg button').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.fmode === 'online')));
+  go('friends');
+  tryPendingJoin();
+  return true;
+}
+function tryPendingJoin() {
+  if (!pendingJoin || !ON.checked || !ON.room || ON.busy) return;
+  const code = pendingJoin; pendingJoin = null;
+  if (ON.m && ON.m.code === code) return;
+  if (ON.m) $('#leaveRoom').click();
+  enterMatch(code, false);
+}
 
 /* ---------- vs computer ---------- */
 const cpu = { level: 1, board: Array(9).fill(null), turn: 'X', over: false, win: null, history: [], hint: null, thinking: false, round: 0, token: 0, session: {} };
@@ -960,6 +979,177 @@ $('#localRematch').onclick = () => { if (!local.win) local.round--; localNew(); 
 $('#localReset').onclick = () => { local.scores = { X: 0, O: 0, D: 0 }; local.round = 0; localNew(); };
 ['X', 'O'].forEach(m => $('#name' + m).addEventListener('input', renderLocal));
 
+/* ---------- public-site multiplayer: tiny MQTT 3.1.1 client over WebSocket (QoS 0) ----------
+   Used only outside Claude (e.g. GitHub Pages). Each player keeps one retained "presence" message
+   per room; a last-will clears it if the tab disappears. Two free public brokers run side by side
+   so a room still works if one of them is down. */
+const IN_CLAUDE = !!(window.claude && typeof window.claude.use === 'function');
+const BROKERS = (() => {
+  try {
+    const u = new URL(location.href).searchParams.get('broker');
+    if (u && /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) return [u];
+  } catch (e) {}
+  return ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+})();
+const TOPIC_ROOT = 'zalarisenterprise-xoxo/v1/';
+const te = new TextEncoder(), td = new TextDecoder();
+const cat = arrs => { let n = 0; arrs.forEach(a => { n += a.length; }); const o = new Uint8Array(n); let i = 0; arrs.forEach(a => { o.set(a, i); i += a.length; }); return o; };
+const mqBytes = b => cat([Uint8Array.of(b.length >> 8, b.length & 255), b]);
+const mqStr = s => mqBytes(te.encode(s));
+const mqLen = n => { const out = []; do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; out.push(d); } while (n > 0); return out; };
+const mqPacket = (first, parts) => { const body = cat(parts); return cat([Uint8Array.from([first, ...mqLen(body.length)]), body]); };
+
+class MiniMqtt {
+  constructor(url, opts) {
+    this.url = url; this.o = opts; this.ws = null; this.buf = new Uint8Array(0);
+    this.connected = false; this.ended = false; this.pid = 1; this.tries = 0;
+    this.onConnect = () => {}; this.onMessage = () => {}; this.onClose = () => {};
+  }
+  start() { if (!this.ended) this.open(); }
+  open() {
+    let ws;
+    try { ws = new WebSocket(this.url, ['mqtt']); } catch (e) { return this.retry(); }
+    this.ws = ws; ws.binaryType = 'arraybuffer'; this.buf = new Uint8Array(0);
+    const timer = setTimeout(() => { if (!this.connected) try { ws.close(); } catch (e) {} }, 9000);
+    ws.onopen = () => {
+      const o = this.o, will = o.will;
+      const flags = 0x02 | (will ? 0x04 | (will.retain ? 0x20 : 0) : 0);
+      const parts = [Uint8Array.of(0, 4, 77, 81, 84, 84, 4, flags, o.keepalive >> 8, o.keepalive & 255), mqStr(o.clientId)];
+      if (will) parts.push(mqStr(will.topic), mqBytes(te.encode(will.payload || '')));
+      this.send(mqPacket(0x10, parts));
+    };
+    ws.onmessage = e => { this.buf = cat([this.buf, new Uint8Array(e.data)]); this.parse(); };
+    ws.onclose = () => {
+      clearTimeout(timer); clearInterval(this.ping);
+      const was = this.connected; this.connected = false;
+      if (was) this.onClose();
+      this.retry();
+    };
+    ws.onerror = () => {};
+  }
+  retry() {
+    if (this.ended) return;
+    this.tries++;
+    setTimeout(() => this.start(), Math.min(15000, 1500 * this.tries) + Math.random() * 800);
+  }
+  send(bytes) { try { if (this.ws && this.ws.readyState === 1) { this.ws.send(bytes); return true; } } catch (e) {} return false; }
+  parse() {
+    for (;;) {
+      const b = this.buf;
+      if (b.length < 2) return;
+      let mul = 1, len = 0, i = 1, byte;
+      do { if (i >= b.length) return; byte = b[i++]; len += (byte & 127) * mul; mul *= 128; } while (byte & 128);
+      if (b.length < i + len) return;
+      const type = b[0] >> 4, flags = b[0] & 15, body = b.slice(i, i + len);
+      this.buf = b.slice(i + len);
+      if (type === 2) {
+        if (body[1] === 0) {
+          this.connected = true; this.tries = 0;
+          clearInterval(this.ping);
+          this.ping = setInterval(() => this.send(Uint8Array.of(0xC0, 0)), this.o.keepalive * 750);
+          this.onConnect();
+        } else { try { this.ws.close(); } catch (e) {} }
+      } else if (type === 3) {
+        const tl = (body[0] << 8) | body[1];
+        const topic = td.decode(body.subarray(2, 2 + tl));
+        let p = 2 + tl; if ((flags >> 1) & 3) p += 2;
+        this.onMessage(topic, td.decode(body.subarray(p)), !!(flags & 1));
+      }
+    }
+  }
+  subscribe(filter) {
+    const id = this.pid = (this.pid % 65000) + 1;
+    return this.send(mqPacket(0x82, [Uint8Array.of(id >> 8, id & 255), mqStr(filter), Uint8Array.of(0)]));
+  }
+  publish(topic, payload, retain) {
+    return this.send(mqPacket(0x30 | (retain ? 1 : 0), [mqStr(topic), te.encode(payload)]));
+  }
+  end() {
+    this.ended = true; clearInterval(this.ping);
+    this.send(Uint8Array.of(0xE0, 0));
+    try { this.ws && this.ws.close(); } catch (e) {}
+  }
+}
+
+function joinPublicRoom(name) {
+  return new Promise((resolve, reject) => {
+    const myId = 'p' + Math.random().toString(36).slice(2, 12);
+    const base = TOPIC_ROOT + name + '/p/', myTopic = base + myId;
+    const mine = {}, peers = new Map(), handlers = new Set(), connHandlers = new Set();
+    let settled = false, queued = false, left = false, lastConn = null;
+    const list = () => {
+      const now = Date.now();
+      for (const [id, v] of peers) if (now - v.seen > 45000) peers.delete(id);
+      return [
+        { peer: myId, by: null, isMe: true, sameTab: true, kind: 'viewer', guest: false, presence: { ...mine }, updatedAt: now },
+        ...[...peers].map(([id, v]) => ({ peer: id, by: null, isMe: false, sameTab: false, kind: 'viewer', guest: false, presence: v.presence, updatedAt: v.seen })),
+      ];
+    };
+    const fire = () => {
+      if (queued) return; queued = true;
+      setTimeout(() => { queued = false; if (left) return; const ps = list(); handlers.forEach(h => { try { h({ peers: ps }); } catch (e) {} }); }, 0);
+    };
+    const isConnected = () => clients.some(c => c.connected);
+    const connChanged = () => {
+      const c = isConnected();
+      if (c !== lastConn) { lastConn = c; connHandlers.forEach(h => { try { h(c); } catch (e) {} }); }
+    };
+    const publishMine = () => {
+      if (left || !Object.keys(mine).length) return;
+      const payload = JSON.stringify({ ...mine, ts: Date.now() });
+      clients.forEach(c => { if (c.connected) c.publish(myTopic, payload, true); });
+    };
+    const clients = BROKERS.map((url, i) => {
+      const c = new MiniMqtt(url, { clientId: myId + 'b' + i, keepalive: 20, will: { topic: myTopic, payload: '', retain: true } });
+      c.onConnect = () => {
+        c.subscribe(base + '+');
+        publishMine(); connChanged();
+        if (!settled) { settled = true; resolve(api); }
+      };
+      c.onClose = connChanged;
+      c.onMessage = (topic, payload) => {
+        if (left || !topic.startsWith(base)) return;
+        const id = topic.slice(base.length);
+        if (!id || id === myId) return;
+        if (!payload) { if (peers.delete(id)) fire(); return; }
+        let d; try { d = JSON.parse(payload); } catch (e) { return; }
+        if (!d || typeof d !== 'object' || Array.isArray(d)) return;
+        const ts = +d.ts || 0;
+        if (Math.abs(Date.now() - ts) > 90000) return; // stale leftover from an old visit
+        const prev = peers.get(id);
+        if (prev && (+prev.presence.ts || 0) > ts) return; // older copy from the other broker
+        peers.set(id, { presence: Object.freeze(d), seen: Date.now() });
+        fire();
+      };
+      return c;
+    });
+    const beat = setInterval(() => { publishMine(); fire(); }, 15000);
+    const api = {
+      name,
+      presence(patch) {
+        for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
+        publishMine(); fire();
+        return Promise.resolve();
+      },
+      peers: list,
+      onPeers(h) { handlers.add(h); setTimeout(() => { if (!left) h({ peers: list() }); }, 0); return () => handlers.delete(h); },
+      connected: isConnected,
+      onConnection(h) { connHandlers.add(h); setTimeout(() => h(isConnected()), 0); return () => connHandlers.delete(h); },
+      leave() {
+        if (left) return Promise.resolve();
+        left = true; clearInterval(beat);
+        clients.forEach(c => { if (c.connected) c.publish(myTopic, '', true); c.end(); });
+        handlers.clear(); connHandlers.clear();
+        return Promise.resolve();
+      },
+    };
+    clients.forEach(c => c.start());
+    setTimeout(() => {
+      if (!settled) { settled = true; left = true; clearInterval(beat); clients.forEach(c => c.end()); reject({ code: 'unavailable' }); }
+    }, 12000);
+  });
+}
+
 /* ---------- friends: online room (live presence, nothing stored) ---------- */
 const U = { user: null, names: {} };
 const ON = { room: null, checked: false, m: null, busy: false, nick: '' };
@@ -981,13 +1171,33 @@ const newCode = () => Array.from({ length: 5 }, () => CODE_CHARS[Math.floor(Math
 function renderLobby() {
   const box = $('#lobby');
   if (ON.m) {
-    box.innerHTML = `<h3>Invite your friend</h3>
-      <ol class="steps">
-        <li>Share this page’s link with them from the Share menu.</li>
-        <li>They open it signed in, go to <b>With a friend → Online room</b>.</li>
-        <li>They enter code <b>${esc(ON.m.code.toUpperCase())}</b> and tap Join.</li>
-      </ol>
-      <div class="players" id="playersList"></div>`;
+    const CODE = esc(ON.m.code.toUpperCase());
+    if (IN_CLAUDE) {
+      box.innerHTML = `<h3>Invite your friend</h3>
+        <ol class="steps">
+          <li>Share this page’s link with them from the Share menu.</li>
+          <li>They open it signed in, go to <b>With a friend → Online room</b>.</li>
+          <li>They enter code <b>${CODE}</b> and tap Join.</li>
+        </ol>
+        <div class="players" id="playersList"></div>`;
+    } else {
+      const link = location.origin + location.pathname + '#join-' + ON.m.code;
+      const wa = 'https://wa.me/?text=' + encodeURIComponent(`Play XOXO with me! Tap to join my room ${ON.m.code.toUpperCase()}: ${link}`);
+      box.innerHTML = `<h3>Invite your friend</h3>
+        <p class="muted small" style="margin:0 0 10px">Send this link. It opens the game and joins your room.</p>
+        <div class="row" style="flex-wrap:nowrap"><input class="inp" id="inviteLink" readonly value="${esc(link)}" style="font-size:13px"><button class="btn sm" id="copyLink">Copy</button></div>
+        <a class="btn block" style="margin-top:8px;text-decoration:none;background:#25D366;color:#fff;border-color:transparent" href="${esc(wa)}" target="_blank" rel="noopener">Share on WhatsApp</a>
+        <p class="muted small" style="margin:10px 0 0">Or they open the site, go to <b>With a friend → Online room</b> and enter <b>${CODE}</b>.</p>
+        <label class="fld" style="margin-top:12px">Your name<input class="inp" id="nickInp2" maxlength="18" placeholder="Shown to your friend" value="${esc(ON.nick)}"></label>
+        <div class="players" id="playersList"></div>`;
+      $('#copyLink').onclick = () => {
+        try { navigator.clipboard.writeText(link).then(() => toast('Invite link copied'), () => { $('#inviteLink').select(); toast('Select and copy the link'); }); }
+        catch (e) { $('#inviteLink').select(); }
+      };
+      $('#inviteLink').onfocus = e => e.target.select();
+      let nt = null;
+      $('#nickInp2').oninput = e => { ON.nick = e.target.value.trim().slice(0, 18); clearTimeout(nt); nt = setTimeout(pushPresence, 500); };
+    }
     renderPlayers();
     return;
   }
@@ -1001,7 +1211,7 @@ function renderLobby() {
     return;
   }
   box.innerHTML = `<h3>Play online</h3>
-    <p class="muted small" style="margin:0 0 12px">Make a room, send your friend the code, and play live.</p>
+    <p class="muted small" style="margin:0 0 12px">Make a room, send your friend the ${IN_CLAUDE ? 'code' : 'link'}, and play live from any phone or computer.</p>
     <label class="fld" style="margin-bottom:12px">Your name (optional)<input class="inp" id="nickInp" maxlength="18" placeholder="Shown to your friend" value="${esc(ON.nick)}"></label>
     <button class="btn primary block" id="createRoom" ${ON.busy ? 'disabled' : ''}>Create a room</button>
     <div class="divider">or join one</div>
@@ -1026,7 +1236,9 @@ async function enterMatch(code, host) {
   try { r = await ON.room.join('xoxo-' + code); }
   catch (e) {
     ON.busy = false; renderLobby();
-    return toast(e && e.code === 'not_permitted' ? 'Online rooms aren’t available for your account here.' : 'Couldn’t open that room. Please try again.');
+    return toast(e && e.code === 'not_permitted' ? 'Online rooms aren’t available for your account here.'
+      : IN_CLAUDE ? 'Couldn’t open that room. Please try again.'
+      : 'Couldn’t reach the game server. Check your internet connection and try again.');
   }
   ON.busy = false;
   const m = { code, r, role: host ? 'X' : null, round: 0, cells: [], joinedAt: Date.now(), scores: { X: 0, O: 0, D: 0 }, counted: new Set(), unsubs: [], connected: true, host };
@@ -1034,7 +1246,7 @@ async function enterMatch(code, host) {
   m.unsubs.push(r.onPeers(() => onlineUpdate(), () => { toast('Lost the connection to the room.'); }));
   m.unsubs.push(r.onConnection(c => { m.connected = c; renderOnline(); }));
   pushPresence();
-  if (!host) setTimeout(() => { if (ON.m === m && !m.role) decideRole(); }, 1500);
+  if (!host) setTimeout(() => { if (ON.m === m && !m.role) decideRole(); }, 2000);
   $('#matchCard').hidden = false;
   renderLobby(); renderOnline();
 }
@@ -1187,10 +1399,12 @@ $('#leaveRoom').onclick = () => {
   renderLobby();
 };
 async function initRoom() {
-  ON.room = await useCap('room');
+  ON.room = IN_CLAUDE ? await useCap('room') : { join: joinPublicRoom };
   ON.checked = true;
   if (fmode === 'online') renderLobby();
+  tryPendingJoin();
 }
+window.addEventListener('pagehide', () => { if (ON.m) { try { ON.m.r.leave(); } catch (e) {} } });
 
 /* ---------- store ---------- */
 function stackSvg(k) {
@@ -1307,7 +1521,7 @@ function renderAll() {
 renderAll();
 cpuNew();
 localNew();
-go(location.hash.slice(1) || 'computer', true);
+if (!takeJoinHash()) go(location.hash.slice(1) || 'computer', true);
 initWallet();
 initRoom();
 })();
